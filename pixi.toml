@@ -1,0 +1,71 @@
+[workspace]
+authors = ["Timothée Carecchio <timothee.carecchio@inria.fr>"]
+name = "so_arm_100_ws"
+version = "0.1.0"
+description = "Workspace ROS 2 for SO-100"
+channels = ["robostack-jazzy", "conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+# ROS 2 Jazzy (remplace Humble pour la compatibilité avec so_arm_100_hardware)
+ros-jazzy-desktop = "*"
+
+# ROS 2 Control
+ros-jazzy-ros2-control = "*"
+ros-jazzy-ros2-controllers = "*"
+ros-jazzy-hardware-interface = "*"
+
+# Pluginlib / lifecycle
+ros-jazzy-pluginlib = "*"
+ros-jazzy-rclcpp-lifecycle = "*"
+
+# Messages
+ros-jazzy-sensor-msgs = "*"
+ros-jazzy-std-msgs = "*"
+ros-jazzy-std-srvs = "*"
+ros-jazzy-trajectory-msgs = "*"
+ros-jazzy-control-msgs = "*"
+
+# MoveIt 2
+ros-jazzy-moveit = "*"
+
+# Gazebo Harmonic + bridge ROS2 
+ros-jazzy-gz-ros2-control = "*"
+ros-jazzy-ros-gz-bridge = "*"
+ros-jazzy-ros-gz-sim = "*"
+
+# URDF / xacro / robot state publisher
+ros-jazzy-xacro = "*"
+ros-jazzy-robot-state-publisher = "*"
+ros-jazzy-joint-state-publisher = "*"
+ros-jazzy-joint-state-publisher-gui = "*"
+ros-jazzy-rviz2 = "*"
+
+# Build tools
+colcon-common-extensions = "*"
+cmake = "*"
+pkg-config = "*"
+c-compiler = "*"
+cxx-compiler = "*"
+lttng-ust = "*"
+yaml-cpp = "*"
+
+[tasks]
+init-src = """
+  mkdir -p src && \
+  (test -d src/SO-100-arm || git clone https://github.com/brukg/SO-100-arm.git src/SO-100-arm) && \
+  (test -d src/so_arm_100_hardware || git clone https://github.com/brukg/so_arm_100_hardware.git src/so_arm_100_hardware)
+"""
+
+# Build complet
+build = { cmd = "colcon build --symlink-install", depends-on = ["init-src"] }
+
+# Source + build
+build-pkgs = """
+  colcon build --symlink-install
+"""
+
+sim = "source install/setup.bash && ros2 launch so_arm_100 gz.launch.py dof:=5"
+rviz = "source install/setup.bash && ros2 launch so_arm_100 rviz.launch.py"
+hardware = "source install/setup.bash && ros2 launch so_arm_100 hardware.launch.py"
+rosdep-install = "rosdep install --from-paths src --ignore-src -r -y"
