@@ -50,6 +50,9 @@ cxx-compiler = "*"
 lttng-ust = "*"
 yaml-cpp = "*"
 
+[activation]
+scripts = ["install/setup.sh"]
+
 [tasks]
 init-src = """
   mkdir -p src && \
@@ -65,7 +68,7 @@ build-pkgs = """
   colcon build --symlink-install
 """
 
-sim = "source install/setup.bash && ros2 launch so_arm_100 gz.launch.py dof:=5"
-rviz = "source install/setup.bash && ros2 launch so_arm_100 rviz.launch.py"
-hardware = "source install/setup.bash && ros2 launch so_arm_100 hardware.launch.py"
+sim = "ros2 launch so_arm_100_bringup gz.launch.py dof:=5"
+rviz = "ros2 launch so_arm_100_bringup rviz.launch.py"
+hardware = "ros2 launch so_arm_100_bringup hardware.launch.py"
 rosdep-install = "rosdep install --from-paths src --ignore-src -r -y"
