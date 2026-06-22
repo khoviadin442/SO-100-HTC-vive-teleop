@@ -47,6 +47,8 @@ JOINT_STATES_TOPIC = "/joint_states"
 
 COLLISION_MARGIN = 0.01
 
+RLIMITS = {"Wrist_Pitch": (-0.7, 0.7)}
+
 def mesh_pkg_dirs():
     return [os.path.dirname(get_package_share_directory('so_arm_100_description'))]
 
@@ -94,6 +96,11 @@ class PinkIK:
         hi = np.array(self.model.upperPositionLimit, float)
         lo[~np.isfinite(lo)] = -np.pi
         hi[~np.isfinite(hi)] = np.pi
+        for j, (jlo,jhi) in RLIMITS.items():
+            if j in self._qidx:
+                qi = self._qidx[j]
+                lo[qi] = max(lo[qi], float(jlo))
+                hi[qi] = min(hi[qi], float(jhi))
         self.model.lowerPositionLimit, self.model.upperPositionLimit = lo, hi
         vl = np.array(self.model.velocityLimit, float)
         vl[~np.isfinite(vl) | (vl <= 0)] = np.pi
@@ -278,6 +285,9 @@ class Bridge(Node):
         self.Rc_ref = None
         self.R_anchor = None
         self._blk =  0
+        self.pos = 0
+        self.eff = 0
+        self.dbg = 0
         print("Bridge up. Waiting for robot...")
 
     def send_arm(self, positions):
@@ -296,6 +306,8 @@ class Bridge(Node):
 
     def on_joint_states(self, msg):
         nm = dict(zip(msg.name, msg.position))
+        self.pos = nm
+        self.eff = dict(zip(msg.name, msg.effort)) if msg.effort else{}
         if not all(j in nm for j in ARM):
             return
         if self.phase == "wait":
@@ -346,6 +358,17 @@ class Bridge(Node):
             R_des = ik.fk_rotation()
 
         q_arm = ik.step(tgt, R_des, DT)
+        self.dbg += 1
+        if self.dbg % 50 == 0:
+            print("blocked=%s" % ik.blocked)
+            for i,j in enumerate(ARM):
+                cmd = float(q_arm[i])
+                meas = self.pos.get(j)
+                eff = self.eff.get(j)
+                ms = "n/a" if meas is None else "%+.4f" % meas
+                gs = "n/a" if meas is None else "%+.4f" % (cmd - meas)
+                es = "n/a" if eff is None else "%+.3f" % eff
+                print("%-16s cmd=%+.4f meas=%s gap=%s eff=%s" % (j, cmd, ms, gs, es))
         if ik.blocked:
             self._blk += 1
             if self._blk % 50 == 1:
