@@ -1,5 +1,5 @@
 import os
-import threading
+import yaml
 import openvr
 import time
 import numpy as np
@@ -16,47 +16,64 @@ from pink.tasks import FrameTask, PostureTask
 from pink.limits import ConfigurationLimit, VelocityLimit
 from ament_index_python.packages import get_package_share_directory
 
-URDF = "/home/kyrylo/tst/so100.urdf"
-EE_FRAME = "End_Effector"
-ARM = ['Shoulder_Rotation', 'Shoulder_Pitch', 'Elbow', 'Wrist_Pitch', 'Wrist_Roll']
-GRIPPER_JOINT = "Gripper"
+path = os.environ.get("teleop_config", os.path.join(os.path.dirname(os.path.abspath(__file__)), "config_teleop.yaml"))
+with open(path) as f:
+    CFG = yaml.safe_load(f)
 
-RATE = 100.0
+URDF = CFG["urdf"]
+EE_FRAME = CFG["ee_frame"]
+ARM = list(CFG["arm"])
+GRIPPER_JOINT = CFG["gripper_joint"]
+
+RATE = float(CFG["rate"])
 DT = 1.0 / RATE
 
-POSITION_COST, ORIENTATION_COST, LM_DAMPING = 1.0, 0.15, 1e-3
-TASK_GAIN, POSTURE_COST, VEL_SCALE = 0.8, 1e-2, 0.9
+POSITION_COST = float(CFG["ik"]["position_cost"])
+ORIENTATION_COST = float(CFG["ik"]["orientation_cost"])
+LM_DAMPING = float(CFG["ik"]["lm_damping"])
+TASK_GAIN = float(CFG["ik"]["task_gain"])
+POSTURE_COST = float(CFG["ik"]["posture_cost"])
+VEL_SCALE = float(CFG["ik"]["vel_scale"])
+COLLISION_MARGIN = float(CFG["ik"]["collision_margin"])
 
-SCALE, AZ_GAIN = 0.6, 2.0
-REACH_LO_FRAC, REACH_HI_FRAC = 0.20, 0.85
+SCALE = float(CFG["teleop"]["scale"])
+AZ_GAIN = float(CFG["teleop"]["az_gain"])
+REACH_LO_FRAC = float(CFG["teleop"]["reach_lo_frac"])
+REACH_HI_FRAC = float(CFG["teleop"]["reach_hi_frac"])
 
-AXIS_SIGN = np.array([-1.0, 1.0, 1.0])
-AXIS_MAP = [0, 2, 1]
+AXIS_SIGN = np.array(CFG["teleop"]["axis_sign"])
+AXIS_MAP = list(CFG["teleop"]["axis_map"])
 M = np.zeros((3, 3))
 for i in range(3):
     M[i, AXIS_MAP[i]] = AXIS_SIGN[i]
 
-HOME_TIME = 3.0
-HOME_Q = [0.0, 0.0, 0.0, 0.0, 0.0]
+HOME_TIME = float(CFG["home"]["time"])
+HOME_Q = list(CFG["home"]["q"])
 
-GRIP_OPEN, GRIP_CLOSE = 1.4, 0.0
-TRIG_TIMEOUT, TRIG_HOLD = 0.15, 0.15
-GRIP_ACTION = "/gripper_controller/gripper_cmd"
-ARM_CMD_TOPIC = "/arm_controller/commands"
-JOINT_STATES_TOPIC = "/joint_states"
+GRIP_OPEN = float(CFG["gripper"]["grip_open"])
+GRIP_CLOSE = float(CFG["gripper"]["grip_close"])
+TRIG_TIMEOUT = float(CFG["gripper"]["trig_timeout"])
+TRIG_HOLD = float(CFG["gripper"]["trig_hold"])
+GRIP_ACTION = CFG["gripper"]["action"]
 
-COLLISION_MARGIN = 0.01
+ARM_CMD_TOPIC = CFG["topics"]["arm_cmd"]
+JOINT_STATES_TOPIC = CFG["topics"]["joint_states"]
 
-RLIMITS = {"Wrist_Pitch": (-0.7, 0.7)}
+RLIMITS = {k: tuple(v) for k,v in CFG["rlimits"].items()}
 
 def mesh_pkg_dirs():
+    """Package dirs used to resolve mesh paths referenced by the URDF."""
     return [os.path.dirname(get_package_share_directory('so_arm_100_description'))]
 
 def srdf_path():
+    """Path to the MoveIt SRDF, used to disable allowed collision pairs."""
     return os.path.join(get_package_share_directory('so_arm_100_moveit_config'), 'config', 'so_arm_100.srdf')
 
 class PinkIK:
+    """Pinocchio model + Pink differential IK for the SO-100 arm with self-collision checking."""
     def __init__(self, urdf_path, ee_frame, arm_joints, gripper_joint=None, position_cost=POSITION_COST, orientation_cost=ORIENTATION_COST,lm_damping=LM_DAMPING, gain=TASK_GAIN, posture_cost=POSTURE_COST, vel_scale=VEL_SCALE, solver=None, srdf_path=None, package_dirs=None, collision_margin=COLLISION_MARGIN):
+        """Build the gripper-locked model and collision geometry, set up frame/posture tasks, 
+        joint limits and the QP solver."""
         full = pin.buildModelFromUrdf(urdf_path)
         locked = []
         if gripper_joint and full.existJointName(gripper_joint):
@@ -92,6 +109,8 @@ class PinkIK:
         self.limits = [ConfigurationLimit(self.model), VelocityLimit(self.model)]
 
     def fix_limits(self, vel_scale):
+        """Replace non-finite position/velocity limits, apply extra per-joint clamps from RLIMITS, 
+        and scale velocity limits."""
         lo = np.array(self.model.lowerPositionLimit, float)
         hi = np.array(self.model.upperPositionLimit, float)
         lo[~np.isfinite(lo)] = -np.pi
@@ -107,35 +126,45 @@ class PinkIK:
         self.model.velocityLimit = vl * float(vel_scale)
 
     def in_collision(self,q):
+        """Return True if configuration q is in self-collision (False when no geometry is loaded)."""
         if self.geom is None:
             return False
         return bool(pin.computeCollisions(self.model, self.col_data, self.geom, self.geom_data, np.asarray(q, float), True))
 
     def qindex(self, joint_name):
+        """Index of a named joint inside the configuration vector q."""
         return self._qidx[joint_name]
 
     def neutral(self):
+        """Model neutral configuration."""
         return pin.neutral(self.model)
 
     @property
     def q(self):
+        """Current configuration q (copy)."""
         return self.configuration.q.copy()
 
     def arm_positions(self):
+        """Current positions of the arm joints, in ARM order."""
         q = self.configuration.q
         return np.array([q[self._qidx[j]] for j in self.arm_joints], float)
 
     def fk_rotation(self):
+        """EE frame rotation in world for the current configuration."""
         return self.configuration.get_transform_frame_to_world(self.ee).rotation.copy()
 
     def fk_translation(self):
+        """EE frame position in world for the current configuration."""
         return self.configuration.get_transform_frame_to_world(self.ee).translation.copy()
 
     def reset_to(self, qf):
+        """Reset the configuration to qf and re-anchor the posture target there."""
         self.configuration = Configuration(self.model, self.data, np.asarray(qf, float))
         self.posture.set_target(self.configuration.q)
 
     def step(self, target_pos, target_R, dt=DT):
+        """One diff-IK step toward (target_pos, target_R): solve, clamp to limits, 
+        reject on collision, return new arm positions."""
         T = pin.SE3(np.asarray(target_R, float), np.asarray(target_pos, float))
         self.ee_task.set_target(T)
         q_prec = self.configuration.q.copy()
@@ -153,131 +182,25 @@ class PinkIK:
             self.configuration = Configuration(self.model, self.data, q_new)
         return self.arm_positions()
 
-
-ik = PinkIK(URDF, EE_FRAME, ARM, GRIPPER_JOINT, srdf_path = srdf_path(), package_dirs = mesh_pkg_dirs())
-_model = ik.model
-
-
-def shoulder_origin():
-    q0 = ik.neutral()
-    fk_model, fk_data = _model, _model.createData()
-    pin.forwardKinematics(fk_model, fk_data, q0)
-    pin.updateFramePlacements(fk_model, fk_data)
-    jid = fk_model.getJointId("Shoulder_Pitch")
-    return fk_data.oMi[jid].translation.copy()
-
-
-SHOULDER = shoulder_origin()
-
-
-def reach_shell(n=60000, seed=0):
-    rng = np.random.default_rng(seed)
-    lo_lim = _model.lowerPositionLimit
-    hi_lim = _model.upperPositionLimit
-    qidx = [ik.qindex(j) for j in ARM[:3]]
-    q = ik.neutral()
-    lo_d, hi_d = 1e9, 0.0
-    samples = rng.uniform([lo_lim[i] for i in qidx], [hi_lim[i] for i in qidx], size=(n, 3))
-    fk_data = _model.createData()
-    for s in samples:
-        for k, i in enumerate(qidx):
-            q[i] = s[k]
-        pin.forwardKinematics(_model, fk_data, q)
-        pin.updateFramePlacements(_model, fk_data)
-        d = np.linalg.norm(fk_data.oMf[_model.getFrameId(EE_FRAME)].translation - SHOULDER)
-        lo_d = min(lo_d, d)
-        hi_d = max(hi_d, d)
-    return lo_d, hi_d
-
-
-MIN_REACH, MAX_REACH = reach_shell()
-R_MIN = MIN_REACH + REACH_LO_FRAC * (MAX_REACH - MIN_REACH)
-R_MAX = MIN_REACH + REACH_HI_FRAC * (MAX_REACH - MIN_REACH)
-
-shared = {"target": None, "home": None, "anchor": None, "ref": None,
-          "engaged": False, "ready": False, "trig_last": 0.0, "Rc": np.eye(3)}
-lock = threading.Lock()
-
-
-def controller():
-    vr = openvr.init(openvr.VRApplication_Other)
-    UNIVERSE = openvr.TrackingUniverseRawAndUncalibrated
-    PAD = 1 << openvr.k_EButton_SteamVR_Touchpad
-    dev = None
-    cur = None
-    pad_was = False
-    try:
-        while True:
-            poses = vr.getDeviceToAbsoluteTrackingPose(UNIVERSE, 0, openvr.k_unMaxTrackedDeviceCount)
-            if dev is None or vr.getTrackedDeviceClass(dev) != openvr.TrackedDeviceClass_Controller:
-                dev = next((i for i in range(openvr.k_unMaxTrackedDeviceCount) if vr.getTrackedDeviceClass(i) == openvr.TrackedDeviceClass_Controller), None)
-            if dev is None:
-                time.sleep(0.05)
-                continue
-
-            p = poses[dev]
-            if p.bPoseIsValid:
-                mm = p.mDeviceToAbsoluteTracking
-                cur = np.array([mm[0][3], mm[1][3], mm[2][3]])
-                Rc = np.array([[mm[0][0], mm[0][1], mm[0][2]],
-                               [mm[1][0], mm[1][1], mm[1][2]],
-                               [mm[2][0], mm[2][1], mm[2][2]]])
-                with lock:
-                    shared["Rc"] = Rc
-                    if shared["ready"] and shared["engaged"]:
-                        d = (cur - shared["ref"])[AXIS_MAP]
-                        newp = shared["anchor"] + SCALE * AXIS_SIGN * d
-                        arel = shared["anchor"] - SHOULDER
-                        rel0 = newp - SHOULDER
-                        az0 = np.arctan2(arel[1], arel[0])
-                        az = np.arctan2(rel0[1], rel0[0])
-                        daz = (az - az0 + np.pi) % (2 * np.pi) - np.pi
-                        naz = az0 + AZ_GAIN * daz
-                        rh = np.hypot(rel0[0], rel0[1])
-                        newp = SHOULDER + np.array([rh * np.cos(naz), rh * np.sin(naz), rel0[2]])
-                        rel = newp - SHOULDER
-                        r = np.linalg.norm(rel)
-                        if r < 1e-6:
-                            newp = shared["target"]
-                        elif r > R_MAX:
-                            newp = SHOULDER + rel * (R_MAX / r)
-                        elif r < R_MIN:
-                            newp = SHOULDER + rel * (R_MIN / r)
-                        shared["target"] = newp
-
-            res, state = vr.getControllerState(dev)
-            if res:
-                pad = bool(state.ulButtonPressed & PAD)
-                trig = state.rAxis[1].x
-                if pad and not pad_was:
-                    with lock:
-                        if shared["ready"] and cur is not None:
-                            if not shared["engaged"]:
-                                shared["ref"] = cur.copy()
-                                shared["anchor"] = shared["target"].copy()
-                                shared["engaged"] = True
-                                print("ENGAGED")
-                            else:
-                                shared["engaged"] = False
-                                print("FROZEN")
-                pad_was = pad
-                if trig > 0.5:
-                    with lock:
-                        shared["trig_last"] = time.monotonic()
-            time.sleep(1.0 / 250.0)
-    finally:
-        openvr.shutdown()
-
-
 class Bridge(Node):
+    """ROS2 node: HTC Vive controller -> Pink diff-IK -> SO-100 arm and gripper."""
     def __init__(self):
+        """Build IK, compute shoulder origin and reach-shell radii, 
+        set up publishers/subscribers/timers and shared teleop state."""
         super().__init__("vive_so100_pink_bridge")
+        self.ik = PinkIK(URDF, EE_FRAME, ARM, GRIPPER_JOINT, srdf_path = srdf_path(), package_dirs = mesh_pkg_dirs())
+        self.model = self.ik.model
+        self.shoulder = self.shoulder_origin()
+        mn,mx = self.reach_shell()
+        self.r_min = mn + REACH_LO_FRAC * (mx - mn)
+        self.r_max = mn + REACH_HI_FRAC * (mx - mn)
         self.phase = "wait"
         self.t_home = None
         self.q_start = None
         self.pub = self.create_publisher(Float64MultiArray, ARM_CMD_TOPIC, 10)
         self.create_subscription(JointState, JOINT_STATES_TOPIC, self.on_joint_states, 10)
         self.create_timer(DT, self.tick)
+        self.create_timer(1.0/250.0, self.vr_tick)
         self.grip = ActionClient(self, ParallelGripperCommand, GRIP_ACTION)
         self._grip_last = None
         self._held_since = None
@@ -288,14 +211,125 @@ class Bridge(Node):
         self.pos = 0
         self.eff = 0
         self.dbg = 0
-        print("Bridge up. Waiting for robot...")
+        self.shared = {"target": None, "home": None, "anchor": None, "ref": None, "engaged": False, "ready": False, "trig_last": 0.0, "Rc": np.eye(3)}
+        self._vr = None
+        self._dev = None
+        self._cur = None
+        self._pad_was = False
+        self._menu_was = False
+        self.mark = False
+        self.get_logger().info("Bridge up. Waiting for robot...")
+
+    def shoulder_origin(self):
+        """World position of the Shoulder_Pitch joint at neutral, used as the teleop workspace center."""
+        q0 = self.ik.neutral()
+        fk_data = self.model.createData()
+        pin.forwardKinematics(self.model, fk_data, q0)
+        pin.updateFramePlacements(self.model, fk_data)
+        jid = self.model.getJointId("Shoulder_Pitch")
+        return fk_data.oMi[jid].translation.copy()
+    
+    def reach_shell(self, n=60000, seed=0):
+        """Monte-Carlo sample the first three joints to estimate min/max EE distance 
+        from the shoulder (reach envelope)."""
+        rng = np.random.default_rng(seed)
+        lo_lim = self.model.lowerPositionLimit
+        hi_lim = self.model.upperPositionLimit
+        qidx = [self.ik.qindex(j) for j in ARM[:3]]
+        q = self.ik.neutral()
+        lo_d, hi_d = 1e9, 0.0
+        samples = rng.uniform([lo_lim[i] for i in qidx], [hi_lim[i] for i in qidx], size=(n, 3))
+        fk_data = self.model.createData()
+        for s in samples:
+            for k, i in enumerate(qidx):
+                q[i] = s[k]
+            pin.forwardKinematics(self.model, fk_data, q)
+            pin.updateFramePlacements(self.model, fk_data)
+            d = np.linalg.norm(fk_data.oMf[self.model.getFrameId(EE_FRAME)].translation - self.shoulder)
+            lo_d = min(lo_d, d)
+            hi_d = max(hi_d, d)
+        return lo_d, hi_d
+
+    def vr_tick(self):
+        """Poll the VR controller: move the target inside the reach shell while engaged, 
+        toggle clutch on trackpad, mark on menu, latch trigger for the gripper."""
+
+        if self._vr is None:
+            try:
+                self._vr = openvr.init(openvr.VRApplication_Other)
+            except Exception as exc:
+                self.get_logger().info(f"Waiting for vr: {exc}", throttle_duration_sec = 2.0)
+                return
+        vr = self._vr
+        UNIVERSE = openvr.TrackingUniverseRawAndUncalibrated
+        PAD = 1 << openvr.k_EButton_SteamVR_Touchpad
+        MENU = 1 << openvr.k_EButton_ApplicationMenu
+        poses = vr.getDeviceToAbsoluteTrackingPose(UNIVERSE, 0, openvr.k_unMaxTrackedDeviceCount)
+        if self._dev is None or vr.getTrackedDeviceClass(self._dev) != openvr.TrackedDeviceClass_Controller:
+            self._dev = next((i for i in range(openvr.k_unMaxTrackedDeviceCount) if vr.getTrackedDeviceClass(i) == openvr.TrackedDeviceClass_Controller), None)
+        if self._dev is None:
+            return
+        p = poses[self._dev]
+        if p.bPoseIsValid:
+            mm = p.mDeviceToAbsoluteTracking
+            self._cur = np.array([mm[0][3], mm[1][3], mm[2][3]])
+            Rc = np.array([[mm[0][0], mm[0][1], mm[0][2]],
+                           [mm[1][0], mm[1][1], mm[1][2]],
+                           [mm[2][0], mm[2][1], mm[2][2]]])
+            self.shared["Rc"] = Rc
+            if self.shared["ready"] and self.shared["engaged"]:
+                d = (self._cur - self.shared["ref"])[AXIS_MAP]
+                newp = self.shared["anchor"] + SCALE * AXIS_SIGN * d
+                arel = self.shared["anchor"] - self.shoulder
+                rel0 = newp - self.shoulder
+                az0 = np.arctan2(arel[1], arel[0])
+                az = np.arctan2(rel0[1], rel0[0])
+                daz = (az - az0 + np.pi) % (2 * np.pi) - np.pi
+                naz = az0 + AZ_GAIN * daz
+                rh = np.hypot(rel0[0], rel0[1])
+                newp = self.shoulder + np.array([rh * np.cos(naz), rh * np.sin(naz), rel0[2]])
+                rel = newp - self.shoulder
+                r = np.linalg.norm(rel)
+                if r < 1e-6:
+                    newp = self.shared["target"]
+                elif r > self.r_max:
+                    newp = self.shoulder + rel * (self.r_max / r)
+                elif r < self.r_min:
+                    newp = self.shoulder + rel * (self.r_min / r)
+                self.shared["target"] = newp
+        res, state = vr.getControllerState(self._dev)
+        if res:
+            menu = bool(state.ulButtonPressed & MENU)
+            pad = bool(state.ulButtonPressed & PAD)
+            trig = state.rAxis[1].x
+            if pad and not self._pad_was:
+                if self.shared["ready"] and self._cur is not None:
+                    if not self.shared["engaged"]:
+                        self.shared["ref"] = self._cur.copy()
+                        self.shared["anchor"] = self.shared["target"].copy()
+                        self.shared["engaged"] = True
+                        self.get_logger().info("ENGAGED")
+                    else:
+                        self.shared["engaged"] = False
+                        self.get_logger().info("FROZEN")
+            self._pad_was = pad
+            if menu and not self._menu_was:
+                self.mark = not self.mark
+                self.get_logger().info(f"RECORD {'ON' if self.mark else 'OFF'}")
+            self._menu_was = menu
+            if trig > 0.5:
+                self.shared["trig_last"] = time.monotonic()
+        
+
 
     def send_arm(self, positions):
+        """Publish arm joint positions to the arm controller."""
         msg = Float64MultiArray()
         msg.data = [float(x) for x in positions]
         self.pub.publish(msg)
 
     def send_grip(self, pos):
+        """Send a gripper position goal via the action client; no-op if the server is not ready."""
         if not self.grip.server_is_ready():
             return False
         goal = ParallelGripperCommand.Goal()
@@ -305,6 +339,7 @@ class Bridge(Node):
         return True
 
     def on_joint_states(self, msg):
+        """Cache measured joint positions/efforts and start homing once all arm joints are known."""
         nm = dict(zip(msg.name, msg.position))
         self.pos = nm
         self.eff = dict(zip(msg.name, msg.effort)) if msg.effort else{}
@@ -314,9 +349,10 @@ class Bridge(Node):
             self.q_start = np.array([nm[j] for j in ARM], float)
             self.t_home = self.get_clock().now()
             self.phase = "homing"
-            print(f"Homing to {HOME_Q} over {HOME_TIME}s (controller ignored)...")
+            self.get_logger().info(f"Homing to {HOME_Q} over {HOME_TIME}s (controller ignored)...")
 
     def tick(self):
+        """Main 100 Hz loop: home the arm, then run diff-IK toward the VR target and drive arm and gripper."""
         if self.phase == "wait":
             return
 
@@ -327,40 +363,45 @@ class Bridge(Node):
             self.send_arm(q_cmd)
             if a < 1.0:
                 return
-            q_home = ik.neutral()
+            q_home = self.ik.neutral()
             for name, val in zip(ARM, HOME_Q):
-                q_home[ik.qindex(name)] = val
-            ik.reset_to(q_home)
-            with lock:
-                shared["home"] = ik.fk_translation()
-                shared["target"] = shared["home"].copy()
-                shared["anchor"] = shared["home"].copy()
-                shared["engaged"] = False
-                shared["ready"] = True
+                q_home[self.ik.qindex(name)] = val
+            self.ik.reset_to(q_home)
+            self.shared["home"] = self.ik.fk_translation()
+            self.shared["target"] = self.shared["home"].copy()
+            self.shared["anchor"] = self.shared["home"].copy()
+            self.shared["engaged"] = False
+            self.shared["ready"] = True
             self.phase = "teleop"
-            print("Teleop ready. Click trackpad to engage.")
+            self.get_logger().info("Teleop ready. Click trackpad to engage.")
             return
 
-        with lock:
-            tgt = shared["target"].copy()
-            Rc = shared["Rc"].copy()
-            engaged = shared["engaged"]
+        tgt = self.shared["target"].copy()
+        Rc = self.shared["Rc"].copy()
+        engaged = self.shared["engaged"]
 
         if engaged and not self._was_engaged:
             self.Rc_ref = Rc.copy()
-            self.R_anchor = ik.fk_rotation()
+            self.R_anchor = self.ik.fk_rotation()
+        if (not engaged) and self._was_engaged and all(j in self.pos for j in ARM):
+            q_hold = self.ik.neutral()
+            for name in ARM:
+                q_hold[self.ik.qindex(name)] = self.pos[name]
+            self.ik.reset_to(q_hold)
+            self.shared["target"] = self.ik.fk_translation()
+            tgt = self.shared["target"].copy()
         self._was_engaged = engaged
 
         if engaged and self.Rc_ref is not None:
             dR = M @ (Rc @ self.Rc_ref.T) @ M.T
             R_des = dR @ self.R_anchor
         else:
-            R_des = ik.fk_rotation()
+            R_des = self.ik.fk_rotation()
 
-        q_arm = ik.step(tgt, R_des, DT)
+        q_arm = self.ik.step(tgt, R_des, DT)
         self.dbg += 1
         if self.dbg % 50 == 0:
-            print("blocked=%s" % ik.blocked)
+            print("blocked=%s" % self.ik.blocked)
             for i,j in enumerate(ARM):
                 cmd = float(q_arm[i])
                 meas = self.pos.get(j)
@@ -369,17 +410,16 @@ class Bridge(Node):
                 gs = "n/a" if meas is None else "%+.4f" % (cmd - meas)
                 es = "n/a" if eff is None else "%+.3f" % eff
                 print("%-16s cmd=%+.4f meas=%s gap=%s eff=%s" % (j, cmd, ms, gs, es))
-        if ik.blocked:
+        if self.ik.blocked:
             self._blk += 1
             if self._blk % 50 == 1:
-                print("collision == block")
+                self.get_logger().info("collision == block")
         else:
             self._blk = 0
         self.send_arm(q_arm)
 
         now = time.monotonic()
-        with lock:
-            trig_last = shared["trig_last"]
+        trig_last = self.shared["trig_last"]
         held = (now - trig_last) < TRIG_TIMEOUT
         if not held:
             self._held_since = None
@@ -391,7 +431,7 @@ class Bridge(Node):
 
 
 def main():
-    threading.Thread(target=controller, daemon=True).start()
+    """Init rclpy, spin the Bridge node, shut down VR and ROS cleanly."""
     rclpy.init()
     node = Bridge()
     try:
@@ -399,6 +439,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        if node._vr is not None:
+            openvr.shutdown()
         node.destroy_node()
         rclpy.ok() and rclpy.shutdown()
 

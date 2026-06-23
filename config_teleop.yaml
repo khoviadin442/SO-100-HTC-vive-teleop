@@ -1,0 +1,43 @@
+---
+
+urdf: /home/kyrylo/tst/so100.urdf
+ee_frame: End_Effector
+arm: [Shoulder_Rotation, Shoulder_Pitch, Elbow, Wrist_Pitch, Wrist_Roll]
+gripper_joint: Gripper
+
+rate: 100.0
+
+ik:
+  position_cost: 1.0
+  orientation_cost: 0.15
+  lm_damping: 0.001
+  task_gain: 0.8
+  posture_cost: 0.02
+  vel_scale: 0.9
+  collision_margin: 0.01
+
+teleop:
+  scale: 0.6
+  az_gain: 2.0
+  reach_lo_frac: 0.20
+  reach_hi_frac: 0.85
+  axis_sign: [-1.0, 1.0, 1.0]
+  axis_map: [0, 2, 1]
+
+home:
+  time: 3.0
+  q: [0.0, 0.0, 0.0, 0.0, 0.0]
+
+gripper:
+  grip_open: 1.4
+  grip_close: 0.0
+  trig_timeout: 0.15
+  trig_hold: 0.15
+  action: /gripper_controller/gripper_cmd
+
+topics:
+  arm_cmd: /arm_controller/commands
+  joint_states: /joint_states
+
+rlimits:
+  Wrist_Pitch: [-0.7, 0.7]
