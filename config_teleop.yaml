@@ -1,28 +1,57 @@
 ---
-
-urdf: /home/kyrylo/tst/so100.urdf
+# SO-100 VR teleop config
+urdf: /home/zxckiryuha/work/SO-100-HTC-vive-teleop/so_arm_100.urdf
+# srdf: null -> auto: <so_arm_100_moveit_config>/config/so_arm_100.srdf
+srdf: null
 ee_frame: End_Effector
 arm: [Shoulder_Rotation, Shoulder_Pitch, Elbow, Wrist_Pitch, Wrist_Roll]
 gripper_joint: Gripper
-
 rate: 100.0
 
 ik:
   position_cost: 1.0
-  orientation_cost: 0.15
-  lm_damping: 0.001
-  task_gain: 0.8
+  orientation_cost: 0.4
+  lm_damping: 0.01            # Levenberg-Marquardt damping: tames velocities near singularities
+  task_gain: 0.9              # per-tick error gain; higher = less tracking lag (keep <= 1.0)
   posture_cost: 0.02
   vel_scale: 0.9
   collision_margin: 0.01
+  # Self-collision handling. barrier: gap >= d_min enforced as a hard QP
+  # inequality -> the arm dodges itself instead of freezing.
+  collision_barrier: true
+  d_min: 0.012                # m, hard minimum link-pair gap (keep > collision_margin)
+  d_influence: 0.03           # m, "near collision" indicator threshold (logs)
+  barrier_gain: 100.0
+  barrier_safe_gain: 0.0      # keep 0: pink's safe-displacement pull acts everywhere and drags the arm
+  self_collision_min_hops: 2  # drop pairs closer than this in the kinematic tree (SRDF already drops adjacent)
+  n_collision_pairs: 0        # 0 = use all pairs in the barrier
 
 teleop:
-  scale: 0.6
-  az_gain: 2.0
-  reach_lo_frac: 0.20
-  reach_hi_frac: 0.85
+  scale: 0.8
+  az_gain: 1.5
+  # near-maximal shell: the barrier now protects the near-base region, so the
+  # inner radius can be almost zero and the outer almost full extension
+  reach_lo_frac: 0.02
+  reach_hi_frac: 0.98
   axis_sign: [-1.0, 1.0, 1.0]
   axis_map: [0, 2, 1]
+  ori_sign: [-1.0, -1.0, 1.0]     # per-axis orientation sense (robot y,x,z); Y flipped to invert pitch
+  # --- latency / smoothing ---
+  pose_prediction: 0.03       # s, OpenVR pose prediction: compensates pipeline+servo delay
+  filter_min_cutoff: 1.5      # one-euro: jitter smoothing at rest (Hz)
+  filter_beta: 15.0           # one-euro: cutoff growth with speed, Hz per m/s -> ~5-10ms lag in motion
+  max_target_speed: 1.2       # m/s cap on target motion
+  max_lead: 0.06              # m, max target distance ahead of the (commanded) EE
+  max_ang_speed: 4.0          # rad/s slew of desired orientation
+  max_ang_lead: 0.4           # rad, max desired-vs-actual EE orientation lead
+  ori_alpha: 0.7              # orientation smoothing (1.0 = off)
+  max_joint_lead: 0.3         # rad, max |cmd - measured| per joint (kills effort-limit runaway)
+  # --- robustness ---
+  pose_timeout: 0.2           # s, VR pose considered stale after this -> freeze + re-anchor on recovery
+  joint_timeout: 0.3          # s, joint_states considered stale after this -> hold command
+  pad_debounce: 0.25          # s, min time between trackpad engage/freeze toggles
+  disengage_blend_ticks: 5    # ticks to blend the command after a freeze (no step)
+  vr_rate: 250.0              # Hz, VR poll rate
 
 home:
   time: 3.0
@@ -36,6 +65,8 @@ gripper:
   action: /gripper_controller/gripper_cmd
 
 topics:
+  # arm_controller is JointGroupPositionController on both sim and hardware,
+  # so it takes Float64MultiArray on /arm_controller/commands directly.
   arm_cmd: /arm_controller/commands
   joint_states: /joint_states
 
